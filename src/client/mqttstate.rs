@@ -369,6 +369,7 @@ fn connect_packet(mqttoptions: &MqttOptions) -> Result<Connect, ConnectError> {
         }
         SecurityOptions::None => (None, None),
     };
+        
     let connect = Connect {
         protocol: Protocol::MQTT(4),
         keep_alive: mqttoptions.keep_alive().as_secs() as u16,

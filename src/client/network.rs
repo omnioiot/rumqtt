@@ -6,8 +6,9 @@ use serde_derive::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use tokio::io::{AsyncRead, AsyncWrite};
 
+#[cfg(feature = "rustls")]
 pub mod stream {
-use crate::client::network::{generate_httpproxy_auth, resolve};
+    use crate::client::network::{generate_httpproxy_auth, resolve};
     use crate::codec::MqttCodec;
     use crate::error::ConnectError;
     use futures::{
@@ -22,8 +23,8 @@ use crate::client::network::{generate_httpproxy_auth, resolve};
         },
         sync::Arc,
     };
-    use tokio::net::TcpStream;
     use tokio::codec::{Decoder, Framed, LinesCodec};
+    use tokio::net::TcpStream;
     use tokio_rustls::{
         rustls::{internal::pemfile, ClientConfig, ClientSession},
         TlsConnector, TlsStream,
@@ -54,7 +55,7 @@ use crate::client::network::{generate_httpproxy_auth, resolve};
         proxy_host: String,
         proxy_port: u16,
         key: Vec<u8>,
-        expiry: i64
+        expiry: i64,
     }
 
     pub struct NetworkStreamBuilder {
@@ -96,7 +97,7 @@ use crate::client::network::{generate_httpproxy_auth, resolve};
                 proxy_host: proxy_host.to_owned(),
                 proxy_port: proxy_port,
                 key: key.to_owned(),
-                expiry
+                expiry,
             });
 
             self
@@ -179,9 +180,7 @@ use crate::client::network::{generate_httpproxy_auth, resolve};
             let addr = resolve(host, port);
             let addr = future::result(addr);
 
-            addr.and_then(|addr| {
-                TcpStream::connect(&addr)
-            })
+            addr.and_then(|addr| TcpStream::connect(&addr))
         }
 
         pub fn connect(
@@ -193,7 +192,13 @@ use crate::client::network::{generate_httpproxy_auth, resolve};
             let host_tcp = host.to_owned();
             let http_proxy = self.http_proxy.clone();
             let stream = match http_proxy {
-                Some(HttpProxy{id, proxy_host, proxy_port, key, expiry}) => {
+                Some(HttpProxy {
+                    id,
+                    proxy_host,
+                    proxy_port,
+                    key,
+                    expiry,
+                }) => {
                     let s = self.http_connect(&id, &proxy_host, proxy_port, &host_tcp, port, &key, expiry);
                     Either::A(s)
                 }
@@ -230,17 +235,239 @@ use crate::client::network::{generate_httpproxy_auth, resolve};
     }
 }
 
+#[cfg(feature = "nativetls")]
+pub mod stream {
+    use crate::client::network::{generate_httpproxy_auth, resolve};
+    use crate::codec::MqttCodec;
+    use crate::error::ConnectError;
+    use futures::{
+        future::{self, Either},
+        sink::Sink,
+        stream::Stream,
+        Future,
+    };
+    use native_tls::Certificate;
+    use std::io;
+    use tokio::codec::{Decoder, Framed, LinesCodec};
+    use tokio::net::TcpStream;
+    use tokio_tls::{TlsConnector, TlsStream};
 
+    #[allow(clippy::large_enum_variant)]
+    pub enum NetworkStream {
+        Tcp(TcpStream),
+        Tls(TlsStream<TcpStream>),
+    }
+
+    impl NetworkStream {
+        pub fn builder() -> NetworkStreamBuilder {
+            NetworkStreamBuilder {
+                certificate_authority: None,
+                client_cert: None,
+                client_private_key: None,
+                alpn_protocols: Vec::new(),
+                http_proxy: None,
+            }
+        }
+    }
+
+    #[derive(Clone)]
+    struct HttpProxy {
+        id: String,
+        proxy_host: String,
+        proxy_port: u16,
+        key: Vec<u8>,
+        expiry: i64,
+    }
+
+    pub struct NetworkStreamBuilder {
+        certificate_authority: Option<Vec<u8>>,
+        client_cert: Option<Vec<u8>>,
+        client_private_key: Option<Vec<u8>>,
+        alpn_protocols: Vec<Vec<u8>>,
+        http_proxy: Option<HttpProxy>,
+    }
+
+    impl NetworkStreamBuilder {
+        pub fn add_certificate_authority(mut self, ca: &[u8]) -> NetworkStreamBuilder {
+            self.certificate_authority = Some(ca.to_vec());
+            self
+        }
+
+        pub fn add_client_auth(mut self, cert: &[u8], private_key: &[u8]) -> NetworkStreamBuilder {
+            self.client_cert = Some(cert.to_vec());
+            self.client_private_key = Some(private_key.to_vec());
+            self
+        }
+
+        pub fn add_alpn_protocols(mut self, protocols: &[Vec<u8>]) -> NetworkStreamBuilder {
+            self.alpn_protocols.append(&mut protocols.to_vec());
+            debug!("{:?}", &self.alpn_protocols);
+            self
+        }
+
+        pub fn set_http_proxy(
+            mut self,
+            id: &str,
+            proxy_host: &str,
+            proxy_port: u16,
+            key: &[u8],
+            expiry: i64,
+        ) -> NetworkStreamBuilder {
+            self.http_proxy = Some(HttpProxy {
+                id: id.to_owned(),
+                proxy_host: proxy_host.to_owned(),
+                proxy_port: proxy_port,
+                key: key.to_owned(),
+                expiry,
+            });
+
+            self
+        }
+
+        fn create_stream(&mut self) -> Result<TlsConnector, ConnectError> {
+            let mut builder = native_tls::TlsConnector::builder();
+            match self.certificate_authority.clone() {
+                Some(ca) => {
+                    let root_ca = Certificate::from_pem(&ca).unwrap();
+                    builder.add_root_certificate(root_ca);
+                }
+                None => return Err(ConnectError::NoCertificateAuthority),
+            }
+
+            match (self.client_cert.clone(), self.client_private_key.clone()) {
+                (Some(_cert), Some(_key)) => {
+                    unimplemented!()
+                    // let mut cert = BufReader::new(Cursor::new(cert));
+                    // let mut keys = BufReader::new(Cursor::new(key));
+
+                    // let certs = pemfile::certs(&mut cert).unwrap();
+                    // let keys = pemfile::rsa_private_keys(&mut keys).unwrap();
+
+                    // config.set_single_client_cert(certs, keys[0].clone());
+                }
+                (None, None) => (),
+                _ => unimplemented!(),
+            };
+
+            if self.alpn_protocols.len() != 0 {
+                unimplemented!();
+                //builder.set_protocols(&self.alpn_protocols);
+            }
+
+            // Ok(TlsConnector::from(Arc::new(config)))
+            Ok(TlsConnector::from(builder.build().unwrap()))
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        pub fn http_connect(
+            &self,
+            id: &str,
+            proxy_host: &str,
+            proxy_port: u16,
+            host: &str,
+            port: u16,
+            key: &[u8],
+            expiry: i64,
+        ) -> impl Future<Item = TcpStream, Error = io::Error> {
+            let proxy_auth = generate_httpproxy_auth(id, key, expiry);
+            let connect = format!(
+                "CONNECT {}:{} HTTP/1.1\r\nHost: {}:{}\r\nProxy-Authorization: {}\r\n\r\n",
+                host, port, host, port, proxy_auth
+            );
+            debug!("{}", connect);
+
+            let codec = LinesCodec::new();
+            let addr = future::result(resolve(proxy_host, proxy_port));
+
+            addr.and_then(|proxy_address| TcpStream::connect(&proxy_address))
+                .and_then(|tcp| {
+                    let framed = Decoder::framed(codec, tcp);
+                    future::ok(framed)
+                })
+                .and_then(|f| f.send(connect))
+                .and_then(|f| f.into_future().map_err(|(e, _f)| e))
+                .and_then(|(s, f)| {
+                    debug!("{:?}", s);
+                    f.into_future().map_err(|(e, _f)| e)
+                })
+                .and_then(|(s, f)| {
+                    debug!("{:?}", s);
+                    f.into_future().map_err(|(e, _f)| e)
+                })
+                .and_then(|(s, f)| {
+                    debug!("{:?}", s);
+                    let stream = f.into_inner();
+                    future::ok(stream)
+                })
+        }
+
+        pub fn tcp_connect(&self, host: &str, port: u16) -> impl Future<Item = TcpStream, Error = io::Error> {
+            let addr = resolve(host, port);
+            let addr = future::result(addr);
+
+            addr.and_then(|addr| TcpStream::connect(&addr))
+        }
+
+        pub fn connect(
+            mut self,
+            host: &str,
+            port: u16,
+        ) -> impl Future<Item = Framed<NetworkStream, MqttCodec>, Error = io::Error> {
+            let tls_connector = self.create_stream();
+            let host_tcp = host.to_owned();
+            let http_proxy = self.http_proxy.clone();
+            let stream = match http_proxy {
+                Some(HttpProxy {
+                    id,
+                    proxy_host,
+                    proxy_port,
+                    key,
+                    expiry,
+                }) => {
+                    let s = self.http_connect(&id, &proxy_host, proxy_port, &host_tcp, port, &key, expiry);
+                    Either::A(s)
+                }
+                None => {
+                    let s = self.tcp_connect(host, port);
+                    Either::B(s)
+                }
+            };
+
+            match tls_connector {
+                Ok(tls_connector) => {
+                    //let domain = DNSNameRef::try_from_ascii_str(&host).unwrap().to_owned();
+                    let host = host.to_owned();
+                    Either::A(
+                        stream
+                            .and_then(move |stream| {
+                                tls_connector
+                                    .connect(&host, stream)
+                                    .map_err(|err| io::Error::new(io::ErrorKind::Other, err))
+                            })
+                            .and_then(|stream| {
+                                let stream = NetworkStream::Tls(stream);
+                                future::ok(MqttCodec.framed(stream))
+                            }),
+                    )
+                }
+                Err(ConnectError::NoCertificateAuthority) => Either::B(stream.and_then(|stream| {
+                    let stream = NetworkStream::Tcp(stream);
+                    future::ok(MqttCodec.framed(stream))
+                })),
+                _ => unimplemented!(),
+            }
+        }
+    }
+}
 fn resolve(host: &str, port: u16) -> Result<SocketAddr, io::Error> {
     use std::net::ToSocketAddrs;
 
-    (host, port).to_socket_addrs()
-        .and_then(|mut addrs| {
-            addrs.next().ok_or_else(|| {
-                let err_msg = format!("invalid hostname '{}'", host);
-                io::Error::new(io::ErrorKind::Other, err_msg)
-            })
+    (host, port).to_socket_addrs().and_then(|mut addrs| {
+        addrs.next().ok_or_else(|| {
+            let err_msg = format!("invalid hostname '{}'", host);
+            io::Error::new(io::ErrorKind::Other, err_msg)
         })
+    })
 }
 
 fn generate_httpproxy_auth(id: &str, key: &[u8], expiry: i64) -> String {
@@ -308,7 +535,6 @@ impl AsyncWrite for NetworkStream {
         }
     }
 }
-
 
 mod test {
     #[test]

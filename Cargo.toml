@@ -19,9 +19,22 @@ derive_more = "0.13"
 base64 = "0.10"
 uuid = {version = "0.7", features = ["serde", "v4"]}
 mqtt311 = "0.2"
-tokio-rustls = ">=0.8, <=0.9"
-webpki = ">=0.8, <=0.19"
 
+[dependencies.native-tls]
+version = "0.2"
+optional = true
+
+[dependencies.tokio-tls]
+version = "0.2"
+optional = true
+
+[dependencies.tokio-rustls]
+version = ">=0.8, <=0.9"
+optional = true
+
+[dependencies.webpki]
+version = ">=0.18, <=0.19"
+optional = true 
 
 [dependencies.jsonwebtoken]
 version = ">=5.0.1, <=6.0"
@@ -46,6 +59,8 @@ serde_derive = "1"
 pretty_env_logger = "0.3"
 
 [features]
-default = ["jwt"]
+default = ["nativetls", "jwt"]
 acknotify = []
+rustls = ["tokio-rustls", "webpki"] 
+nativetls = ["native-tls", "tokio-tls", "webpki"] 
 jwt = ["jsonwebtoken", "chrono", "serde", "serde_derive"]
